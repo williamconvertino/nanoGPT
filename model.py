@@ -99,10 +99,28 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        self.config = config
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        if self.config.ln_setting == 'pre':
+            x = x + self.attn(self.ln_1(x))
+        elif self.config.ln_setting == 'post':
+            x = x + self.ln_1(self.attn(x))
+        elif self.config.ln_setting == 'skip':
+            x = self.ln_1(x + self.attn(x))
+        else:
+            x = x + self.attn(x)
+            
+        if self.config.use_ffn:
+            if self.config.ln_setting == 'pre':
+                x = x + self.mlp(self.ln_2(x))
+            elif self.config.ln_setting == 'post':
+                x = x + self.ln_2(self.mlp(x))
+            elif self.config.ln_setting == 'skip':
+                x = self.ln_2(x + self.mlp(x))
+            else:
+                x = x + self.mlp(x)
+        
         return x
 
 @dataclass
@@ -114,6 +132,11 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_ffn: bool = True
+    use_ln_ffn: bool = True
+    use_ln_attn: bool = True
+    ln_setting: str = 'post' # 'pre' attention, 'post' attention, or after 'skip' layer norm in the transformer
+    ppe_embedding: bool = False
 
 class GPT(nn.Module):
 
