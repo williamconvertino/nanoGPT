@@ -41,6 +41,9 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        
+        self.input_vectors = config.input_vectors
+        
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -49,11 +52,22 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, e, p):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        
+        vector_map = {'w': x, 'x': x, 'e': e, 'p': p}
+        
+        q = vector_map[self.input_vectors[0]]
+        k = vector_map[self.input_vectors[1]]
+        v = vector_map[self.input_vectors[2]]
+        
+        q = self.c_attn(q)
+        k = self.c_attn(k)
+        v = self.c_attn(v)
+        
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -100,26 +114,28 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
         self.config = config
+        self.ln_setting = config.ln_setting
+        self.use_ff = config.use_ff
 
-    def forward(self, x):
-        if self.config.ln_setting == 'pre':
-            x = x + self.attn(self.ln_1(x))
-        elif self.config.ln_setting == 'post':
-            x = x + self.ln_1(self.attn(x))
-        elif self.config.ln_setting == 'skip':
-            x = self.ln_1(x + self.attn(x))
+    def forward(self, x, e, p):
+        
+        attn_out = self.attn(x, e, p)
+        
+        if self.ln_setting == 'pre':
+            x = x + self.ln_1(attn_out)
+        elif self.ln_setting == 'post':
+            x = self.ln_1(x + attn_out)
         else:
-            x = x + self.attn(x)
-            
-        if self.config.use_ffn:
-            if self.config.ln_setting == 'pre':
-                x = x + self.mlp(self.ln_2(x))
-            elif self.config.ln_setting == 'post':
-                x = x + self.ln_2(self.mlp(x))
-            elif self.config.ln_setting == 'skip':
-                x = self.ln_2(x + self.mlp(x))
+            x = x + attn_out
+        
+        if self.use_ff:
+            ff_out = self.mlp(x)
+            if self.ln_setting == 'pre':
+                x = x + self.ln_2(ff_out)
+            elif self.ln_setting == 'post':
+                x = self.ln_2(x + ff_out)
             else:
-                x = x + self.mlp(x)
+                x = x + ff_out
         
         return x
 
@@ -132,11 +148,9 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    use_ffn: bool = True
-    use_ln_ffn: bool = True
-    use_ln_attn: bool = True
-    ln_setting: str = 'post' # 'pre' attention, 'post' attention, or after 'skip' layer norm in the transformer
-    ppe_embedding: bool = False
+    use_ff: bool = True
+    ln_setting: str = 'post' # 'pre' skip or 'post' 'skip' layer norm (or None)
+    input_vectors: list = ['w', 'w', 'w']
 
 class GPT(nn.Module):
 
@@ -159,6 +173,10 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        self.x_ln = LayerNorm(config.n_embd, bias=config.bias)
+        self.p_ln = LayerNorm(config.n_embd, bias=config.bias)
+        self.e_ln = LayerNorm(config.n_embd, bias=config.bias)
 
         # init all weights
         self.apply(self._init_weights)
@@ -197,11 +215,17 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        e = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        p = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(e + p)
+        
+        # Add layer norm to embeddings
+        x = self.x_ln(x)
+        e = self.e_ln(e)
+        p = self.p_ln(p)
+        
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, e, p)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
